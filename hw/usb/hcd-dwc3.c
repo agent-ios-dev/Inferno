@@ -192,7 +192,7 @@ static int dwc3_bd_length(DWC3State* s, dma_addr_t tdaddr)
          * continues. Do not combine independently completed requests into
          * one DMA mapping: after an IOC the guest may unmap the completed
          * request while later ring entries are still owned by hardware. */
-        if (TRB_CTRL_TRBCTL(trb.ctrl) == TRBCTL_NORMAL && !(trb.ctrl & TRB_CTRL_CHN)) { return length; }
+        if (!(trb.ctrl & TRB_CTRL_CHN)) { return length; }
     }
 }
 
@@ -816,7 +816,7 @@ static void dwc3_td_fetch(DWC3State* s, DWC3Transfer* xfer, dma_addr_t tdaddr)
                 DPRINTF("%s: ended;break: (trb.ctrl & TRB_CTRL_LST)\n", __func__);
                 break;
             }
-            if (controlType == TRBCTL_NORMAL && !(trb.ctrl & TRB_CTRL_CHN)) { break; }
+            if (!(trb.ctrl & TRB_CTRL_CHN)) { break; }
         }
         while (!ended);
         if (desc->count == 0) {
