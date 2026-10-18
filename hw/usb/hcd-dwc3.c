@@ -605,11 +605,15 @@ static MemTxResult dwc3_bd_rw(DWC3BufferDesc* desc, void* buffer, size_t length,
         MemTxResult result = write
             ? dma_memory_write(desc->sgl.as, entry->base + offset, bytes, count, MEMTXATTRS_UNSPECIFIED)
             : dma_memory_read(desc->sgl.as, entry->base + offset, bytes, count, MEMTXATTRS_UNSPECIFIED);
-        if (result != MEMTX_OK) { return result; }
+        if (result != MEMTX_OK) {
+            error_report("DWC3-DMA: address space rejected current range");
+            return result;
+        }
         bytes += count;
         length -= count;
         offset = 0;
     }
+    if (length) { error_report("DWC3-DMA: scatter range exhausted"); }
     return length ? MEMTX_ERROR : MEMTX_OK;
 }
 
