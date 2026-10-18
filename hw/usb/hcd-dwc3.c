@@ -587,6 +587,32 @@ end:
     return ret;
 }
 
+/* Translate only bytes transferred now. Mapping the whole scatter list also
+ * walks buffers for future requests, including pages which the guest can
+ * release after a completion interrupt. Keep no translated host pointers
+ * across USB packets or DART invalidations. */
+static MemTxResult dwc3_bd_rw(DWC3BufferDesc* desc, void* buffer, size_t length, bool write)
+{
+    dma_addr_t offset = desc->actual_length;
+    uint8_t* bytes = buffer;
+    for (int i = 0; i < desc->sgl.nsg && length; i++) {
+        ScatterGatherEntry* entry = &desc->sgl.sg[i];
+        if (offset >= entry->len) {
+            offset -= entry->len;
+            continue;
+        }
+        size_t count = MIN(length, entry->len - offset);
+        MemTxResult result = write
+            ? dma_memory_write(desc->sgl.as, entry->base + offset, bytes, count, MEMTXATTRS_UNSPECIFIED)
+            : dma_memory_read(desc->sgl.as, entry->base + offset, bytes, count, MEMTXATTRS_UNSPECIFIED);
+        if (result != MEMTX_OK) { return result; }
+        bytes += count;
+        length -= count;
+        offset = 0;
+    }
+    return length ? MEMTX_ERROR : MEMTX_OK;
+}
+
 static int dwc3_bd_copy(DWC3State* s, DWC3BufferDesc* desc, USBPacket* p)
 {
     g_autofree void* buffer      = NULL;
@@ -603,13 +629,6 @@ static int dwc3_bd_copy(DWC3State* s, DWC3BufferDesc* desc, USBPacket* p)
     // desc_left (dwc3) == amtDone before (dwc2)
     // xfer_size (dwc3) == amtDone after (dwc2)
 
-    // maybe do map/unmap even when xfer_size is zero. is this only about speed,
-    // or also about correctness?
-    if (dwc3_bd_map(s, desc, p)) {
-        // do dwc3_bd_free at the caller instead
-        return -1;
-    }
-
     // depend on a non-null pointer, even if xfer_size is zero.
     buffer = g_malloc0(MAX(xfer_size, 1));
     assert_nonnull(buffer);
@@ -620,7 +639,11 @@ static int dwc3_bd_copy(DWC3State* s, DWC3BufferDesc* desc, USBPacket* p)
         DPRINTF("%s: p: 0x%x/0x%lx\n", __func__, p->actual_length, usb_packet_size(p));
 #endif
         if (xfer_size) {
-            actual_xfer = qemu_iovec_to_buf(&desc->iov, desc->actual_length, buffer, xfer_size);
+            if (dwc3_bd_rw(desc, buffer, xfer_size, false) != MEMTX_OK) {
+                p->status = USB_RET_IOERROR;
+                return -1;
+            }
+            actual_xfer = xfer_size;
             usb_packet_copy(p, buffer, xfer_size);
 #if 0
             HEXDUMP(__func__, buffer, xfer_size);
@@ -641,7 +664,11 @@ static int dwc3_bd_copy(DWC3State* s, DWC3BufferDesc* desc, USBPacket* p)
 #endif
         if (xfer_size) {
             usb_packet_copy(p, buffer, xfer_size);
-            actual_xfer = qemu_iovec_from_buf(&desc->iov, desc->actual_length, buffer, xfer_size);
+            if (dwc3_bd_rw(desc, buffer, xfer_size, true) != MEMTX_OK) {
+                p->status = USB_RET_IOERROR;
+                return -1;
+            }
+            actual_xfer = xfer_size;
 #if 0
             HEXDUMP(__func__, buffer, xfer_size);
 #endif
