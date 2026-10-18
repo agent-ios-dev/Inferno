@@ -28,6 +28,7 @@
 #include "qapi/error.h"
 #include "qemu/bitops.h"
 #include "qemu/error-report.h"
+#include "qemu/processor.h"
 #include "system/dma.h"
 #include "qobject/qdict.h"
 
@@ -662,6 +663,19 @@ static int apple_dart_mapper_notify_flag_changed(IOMMUMemoryRegion* mr, IOMMUNot
                                                  Error** errp)
 { return 0; }
 
+static void apple_dart_wait_for_invalidation(AppleDARTMapperInstance* mapper)
+{
+    if (!REG_FIELD_EX32(qatomic_load_acquire(&mapper->regs.tlb_op), DART_TLB_OP, BUSY)) { return; }
+    const char* device_id = mapper->common.dart->parent_obj.parent_obj.id;
+    if (device_id && strcmp(device_id, "dart-usb") == 0) {
+        error_report("DART-USB: translation waited for invalidation");
+    }
+    /* BUSY now covers only bounded generation atomics, never notifier
+     * callbacks or anything waiting for this translation. Observe completion
+     * before consulting the cache/page table instead of fabricating a fault. */
+    while (REG_FIELD_EX32(qatomic_load_acquire(&mapper->regs.tlb_op), DART_TLB_OP, BUSY)) { cpu_relax(); }
+}
+
 static IOMMUTLBEntry apple_dart_mapper_translate(IOMMUMemoryRegion* mr, hwaddr addr, IOMMUAccessFlags flag,
                                                  int iommu_idx)
 {
@@ -680,13 +694,7 @@ static IOMMUTLBEntry apple_dart_mapper_translate(IOMMUMemoryRegion* mr, hwaddr a
         .perm      = IOMMU_NONE,
     };
 
-    if (REG_FIELD_EX32(qatomic_read(&mapper->regs.tlb_op), DART_TLB_OP, BUSY)) {
-        const char* device_id = dart->parent_obj.parent_obj.id;
-        if (device_id && strcmp(device_id, "dart-usb") == 0) {
-            error_report("DART-USB: translation requested during invalidation");
-        }
-        return entry;
-    }
+    apple_dart_wait_for_invalidation(mapper);
 
     sid = apple_dart_sid_remap(mapper, sid);
 
