@@ -1053,6 +1053,8 @@ static void dwc3_dcore_reset(DWC3State* s, bool soft)
 
         if (ep->uep) {
             QTAILQ_FOREACH (p, &ep->uep->queue, queue) {
+                error_report("DWC3-IOERROR: controller reset, ep=%d pid=%d actual=%d", ep->epid, p->pid,
+                             p->actual_length);
                 p->status = USB_RET_IOERROR;
                 usb_packet_complete(udev, p);
             }
@@ -1639,6 +1641,8 @@ static void usb_dwc3_depcmdreg_write(void* opaque, hwaddr addr, int index, uint6
                         if (ep->uep) {
                             USBPacket* p = NULL;
                             QTAILQ_FOREACH (p, &ep->uep->queue, queue) {
+                                error_report("DWC3-IOERROR: guest ENDXFER, ep=%d pid=%d actual=%d", ep->epid,
+                                             p->pid, p->actual_length);
                                 p->status = USB_RET_IOERROR;
                                 usb_packet_complete(udev, p);
                             }
@@ -1939,7 +1943,11 @@ complete:
     // of the times without change in behavior.
     if (p->status != USB_RET_ASYNC) {
         if (usb_packet_is_inflight(p)) {
-            if (p->status == USB_RET_NAK) { p->status = USB_RET_IOERROR; }
+            if (p->status == USB_RET_NAK) {
+                error_report("DWC3-IOERROR: queued packet became NAK, ep=%d pid=%d actual=%d", ep->epid,
+                             p->pid, p->actual_length);
+                p->status = USB_RET_IOERROR;
+            }
             // usb_packet_complete must be inside the usb_packet_is_inflight
             // "if"
             usb_packet_complete(udev, p);
@@ -2080,6 +2088,8 @@ status_update:
         if (p->status == USB_RET_NAK) {
             // This rewrite must happen instead of calling
             // "dwc3_process_packet"!
+            error_report("DWC3-IOERROR: inflight dispatch became NAK, ep=%d pid=%d actual=%d", epid, p->pid,
+                         p->actual_length);
             p->status = USB_RET_IOERROR;
         }
     }
