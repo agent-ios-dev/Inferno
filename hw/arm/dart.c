@@ -27,6 +27,7 @@
 #include "monitor/monitor.h"
 #include "qapi/error.h"
 #include "qemu/bitops.h"
+#include "qemu/error-report.h"
 #include "system/dma.h"
 #include "qobject/qdict.h"
 
@@ -523,6 +524,24 @@ static void apple_dart_mapper_set_error(AppleDARTMapperInstance* mapper, hwaddr 
 {
     uint32_t old;
 
+    /* Fixed fault categories only: no guest address, PTE or memory contents. */
+    const char* device_id = mapper->common.dart->parent_obj.parent_obj.id;
+    if (device_id && strcmp(device_id, "dart-usb") == 0) {
+        if (REG_FIELD_EX32(status, DART_ERROR_STATUS, TTBR_INVLD)) {
+            error_report("DART-USB: invalid translation table");
+        }
+        if (REG_FIELD_EX32(status, DART_ERROR_STATUS, L2E_INVLD)) {
+            error_report("DART-USB: unreadable page table");
+        }
+        if (REG_FIELD_EX32(status, DART_ERROR_STATUS, PTE_INVLD)) {
+            error_report("DART-USB: invalid page entry");
+        }
+        if (REG_FIELD_EX32(status, DART_ERROR_STATUS, WRITE_PROT)
+            || REG_FIELD_EX32(status, DART_ERROR_STATUS, READ_PROT)) {
+            error_report("DART-USB: page protection rejected access");
+        }
+    }
+
     qatomic_set__nocheck(&mapper->regs.error_address, addr);
 
     do {
@@ -655,7 +674,13 @@ static IOMMUTLBEntry apple_dart_mapper_translate(IOMMUMemoryRegion* mr, hwaddr a
         .perm      = IOMMU_NONE,
     };
 
-    if (REG_FIELD_EX32(qatomic_read(&mapper->regs.tlb_op), DART_TLB_OP, BUSY)) { return entry; }
+    if (REG_FIELD_EX32(qatomic_read(&mapper->regs.tlb_op), DART_TLB_OP, BUSY)) {
+        const char* device_id = dart->parent_obj.parent_obj.id;
+        if (device_id && strcmp(device_id, "dart-usb") == 0) {
+            error_report("DART-USB: translation requested during invalidation");
+        }
+        return entry;
+    }
 
     sid = apple_dart_sid_remap(mapper, sid);
 
