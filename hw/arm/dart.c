@@ -406,11 +406,17 @@ static void apple_dart_mapper_reg_write(void* opaque, hwaddr addr, uint64_t data
                     if ((sid_mask & BIT_ULL(i)) == 0) { continue; }
 
                     apple_dart_tlb_flush_sid(mapper, apple_dart_sid_remap(mapper, i));
-                    apple_dart_notify_remap(mapper, i);
                 }
             }
 
+            /* Notifiers may translate again while replaying mappings. Publish
+             * every generation update and finish the atomic invalidation
+             * before invoking them; otherwise our own translate callback
+             * returns IOMMU_NONE solely because BUSY is still set. */
             qatomic_and(&mapper->regs.tlb_op, ~R_DART_TLB_OP_BUSY_MASK);
+            for (i = 0; i < DART_MAX_STREAMS; ++i) {
+                if ((sid_mask & BIT_ULL(i)) != 0) { apple_dart_notify_remap(mapper, i); }
+            }
             break;
         case R_DART_TLB_OP_SET_0_LOW:
             if (!REG_FIELD_EX32(qatomic_read(&mapper->regs.tlb_op), DART_TLB_OP, BUSY)) {
