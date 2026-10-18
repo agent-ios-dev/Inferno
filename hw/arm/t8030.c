@@ -2919,6 +2919,34 @@ PROP_VISIT_GETTER_SETTER(uint32, disp_height);
 PROP_VISIT_GETTER_SETTER(uint32, disp_scale);
 PROP_GETTER_SETTER(bool, enable_pac);
 
+/* The in-process iOS host cannot qemu_init twice. After ASR and the real
+ * filesystem patcher finish, QMP pauses the machine and switches this boot
+ * source before system_reset/cont. No installed data or SEP state is seeded. */
+static bool t8030_get_system_boot_after_restore(Object* obj, Error** errp)
+{
+    return MACHINE(obj)->initrd_filename == NULL;
+}
+
+static void t8030_set_system_boot_after_restore(Object* obj, bool value, Error** errp)
+{
+    AppleT8030MachineState* t8030 = APPLE_T8030(obj);
+    MachineState* machine = MACHINE(obj);
+    Object* smc = object_resolve_path_component(obj, "smc");
+
+    if (!value || machine->initrd_filename == NULL || smc == NULL || runstate_is_running()) {
+        error_setg(errp, "Pause an initialized restore machine before switching to system boot");
+        return;
+    }
+    if (!object_property_set_bool(smc, "hold-reset", false, errp)) { return; }
+    g_clear_pointer(&machine->initrd_filename, g_free);
+    t8030->boot_info.ramdisk_addr = 0;
+    t8030->boot_info.ramdisk_size = 0;
+    /* The restore has already been patched. Do not hit the desktop-only
+     * completion exit(0) in t8030_memory_setup on this deliberate reset. */
+    t8030->boot_info.non_cold_boot = false;
+    t8030->boot_info.boot_mode = kAppleBootModeExitRecovery;
+}
+
 static void t8030_class_init(ObjectClass* klass, const void* data)
 {
     MachineClass*   mc = MACHINE_CLASS(klass);
@@ -2933,6 +2961,10 @@ static void t8030_class_init(ObjectClass* klass, const void* data)
     mc->default_ram_size  = 4 * GiB;
     mc->fixup_ram_size    = t8030_fixup_ram_size;
     mc->default_ram_id    = "t8030.ram";
+    object_class_property_add_bool(klass, "system-boot-after-restore",
+                                   t8030_get_system_boot_after_restore, t8030_set_system_boot_after_restore);
+    object_class_property_set_description(klass, "system-boot-after-restore",
+                                           "Switch a paused restored VM to disk boot without reinitializing QEMU");
 
     object_class_property_add_str(klass, "trustcache", t8030_get_trustcache_filename, t8030_set_trustcache_filename);
     object_class_property_set_description(klass, "trustcache", "TrustCache");
