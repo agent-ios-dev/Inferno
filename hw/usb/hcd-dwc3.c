@@ -640,6 +640,7 @@ static int dwc3_bd_copy(DWC3State* s, DWC3BufferDesc* desc, USBPacket* p)
 #endif
         if (xfer_size) {
             if (dwc3_bd_rw(desc, buffer, xfer_size, false) != MEMTX_OK) {
+                error_report("DWC3-DMA: current IN range failed");
                 p->status = USB_RET_IOERROR;
                 return -1;
             }
@@ -665,6 +666,7 @@ static int dwc3_bd_copy(DWC3State* s, DWC3BufferDesc* desc, USBPacket* p)
         if (xfer_size) {
             usb_packet_copy(p, buffer, xfer_size);
             if (dwc3_bd_rw(desc, buffer, xfer_size, true) != MEMTX_OK) {
+                error_report("DWC3-DMA: current OUT range failed");
                 p->status = USB_RET_IOERROR;
                 return -1;
             }
