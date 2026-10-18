@@ -671,6 +671,35 @@ static int dwc3_bd_copy(DWC3State* s, DWC3BufferDesc* desc, USBPacket* p)
             usb_packet_copy(p, buffer, xfer_size);
             if (dwc3_bd_rw(desc, buffer, xfer_size, true) != MEMTX_OK) {
                 error_report("DWC3-DMA: current OUT range failed");
+                /* Inspect ownership only after the failed access. No buffer
+                 * contents or guest addresses are logged, and the failure is
+                 * still propagated; this is not a DMA retry or bypass. */
+                dma_addr_t offset = desc->actual_length;
+                for (int i = 0; i < desc->count; i++) {
+                    if (offset >= desc->sgl.sg[i].len) {
+                        offset -= desc->sgl.sg[i].len;
+                        continue;
+                    }
+                    struct dwc3_trb current = {0};
+                    if (dma_memory_read(desc->sgl.as, desc->trbs[i].addr, &current, sizeof(current),
+                                        MEMTXATTRS_UNSPECIFIED) != MEMTX_OK) {
+                        error_report("DWC3-DMA: failed OUT descriptor unreadable");
+                    }
+                    else {
+                        if (!(current.ctrl & TRB_CTRL_HWO)) {
+                            error_report("DWC3-DMA: failed OUT descriptor no longer owned");
+                        }
+                        if (dwc3_addr64(current.bpl, current.bph) != desc->trbs[i].bp) {
+                            error_report("DWC3-DMA: failed OUT descriptor buffer changed");
+                        }
+                        if (current.status != desc->trbs[i].status) {
+                            error_report("DWC3-DMA: failed OUT descriptor status changed");
+                        }
+                    }
+                    error_report("DWC3-DMA: failed OUT descriptor index=%d count=%d actual=%u total=%u", i,
+                                 desc->count, desc->actual_length, desc->length);
+                    break;
+                }
                 p->status = USB_RET_IOERROR;
                 return -1;
             }
