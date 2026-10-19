@@ -28,6 +28,7 @@
 #include "qemu/cutils.h"
 #include "qemu/error-report.h"
 #include "qemu/log.h"
+#include "qemu/timer.h"
 #include "qom/object.h"
 #include "trace.h"
 
@@ -1841,7 +1842,9 @@ static void dwc3_process_packet(DWC3State* s, DWC3Endpoint* ep, USBPacket* p)
     }
 
     xfer = ep->xfer;
+    ep->out_nak_reason = 4; /* Unexpected status after a descriptor copy. */
     if (xfer == NULL) {
+        ep->out_nak_reason = 2;
         // xfer == NULL == URB_COMPLETE
         assert(p->status != USB_RET_ASYNC);
         if (setup_ep->last_control_command == TRBCTL_CONTROL_SETUP) {
@@ -1926,6 +1929,7 @@ static void dwc3_process_packet(DWC3State* s, DWC3Endpoint* ep, USBPacket* p)
 #endif
         desc = QTAILQ_FIRST(&xfer->buffers);
         if (desc == NULL) {
+            ep->out_nak_reason = 3;
             // one specific packet keeps repeating if returning NAK (or
             // SUCCESS^H^H^H) here, despite everything seem to work as usual.
             // let's try to abuse that to keep the host from choking/starving us
@@ -2108,6 +2112,7 @@ static void dwc3_usb_device_handle_packet(USBDevice* dev, USBPacket* p)
     }
 
     if (!(s->dalepena & (1 << epid))) {
+        ep->out_nak_reason = 1;
         DPRINTF("%s: ! s->dalepena 0x%x epid %d\n", __func__, s->dalepena, epid);
         // dwc2 would do ASYNC instead of NAK in this case.
         p->status = USB_RET_NAK;
@@ -2117,19 +2122,26 @@ static void dwc3_usb_device_handle_packet(USBDevice* dev, USBPacket* p)
     dwc3_process_packet(s, ep, p);
 
 status_update:
-    /* Record the controller state once per prolonged bulk OUT refusal. No
+    /* Record the controller state at most once per five seconds of OUT NAK. No
      * guest addresses, descriptors or payload bytes leave the emulator. Do
      * not change endpoint events, ownership, retries or completion status. */
     if (epid >= 2 && p->pid == USB_TOKEN_OUT) {
         DWC3Endpoint* out_ep = &s->eps[epid];
         if (p->status == USB_RET_NAK) {
-            if (out_ep->consecutive_out_naks < 1024 && ++out_ep->consecutive_out_naks == 1024) {
+            if (out_ep->consecutive_out_naks < UINT32_MAX) { out_ep->consecutive_out_naks++; }
+            int64_t now = qemu_clock_get_ms(QEMU_CLOCK_REALTIME);
+            if (now - out_ep->out_nak_report_ms >= 5000) {
+                out_ep->out_nak_report_ms = now;
                 DWC3Transfer* active = out_ep->xfer;
+                DWC3BufferDesc* first = active ? QTAILQ_FIRST(&active->buffers) : NULL;
                 unsigned pending = out_ep->intrnum < DWC3_NUM_INTRS ? s->intrs[out_ep->intrnum].count : 0;
-                error_report("DWC3-OUT-NAK: ep=%u enabled=%u transfer=%u buffers=%u free=%u control=%u events=%u pending=%u",
+                error_report("DWC3-OUT-NAK: ep=%u enabled=%u transfer=%u buffers=%u free=%u control=%u events=%u pending=%u reason=%u first=%u trbs=%u actual=%u total=%u naks=%u",
                              out_ep->epid, !!(s->dalepena & (1u << epid)), !!active,
                              active ? active->count : 0, active ? active->can_free : 0,
-                             s->eps[epid & ~1].last_control_command, out_ep->event_en, pending);
+                             s->eps[epid & ~1].last_control_command, out_ep->event_en, pending,
+                             out_ep->out_nak_reason, !!first, first ? first->count : 0,
+                             first ? first->actual_length : 0, first ? first->length : 0,
+                             out_ep->consecutive_out_naks);
             }
         }
         else { out_ep->consecutive_out_naks = 0; }

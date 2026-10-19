@@ -104,6 +104,8 @@ typedef struct DWC3Endpoint
     uint32_t rsc_idx_counter;
     /* Diagnostic only: saturates, and resets after a non-NAK OUT. */
     uint32_t consecutive_out_naks;
+    int64_t out_nak_report_ms;
+    uint32_t out_nak_reason;
 } DWC3Endpoint;
 
 typedef struct DWC3DeviceState
