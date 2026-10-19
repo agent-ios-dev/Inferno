@@ -1295,26 +1295,33 @@ if not get_option('bzip2').auto() or have_block
 endif
 
 if host_os == 'darwin'
-  if host_arch == 'aarch64'
-    brew_inc_dirs = include_directories('/opt/homebrew/include/', is_system: true)
-  else
-    brew_inc_dirs = include_directories('/usr/local/include/', is_system: true)
-  endif
   # Try the compiler's own search path first: a cross build (iOS) has lzfse in
   # its own sysroot/prefix, and the Homebrew copy is the wrong architecture.
   raw_liblzfse = cc.find_library('lzfse', has_headers: ['lzfse.h'], required: false)
-  if not raw_liblzfse.found()
+  if raw_liblzfse.found()
+    liblzfse = declare_dependency(dependencies: raw_liblzfse)
+  elif meson.is_cross_build()
+    # Do not inspect host Homebrew directories when targeting iOS, including
+    # arm64 iOS cross-built on an Intel Mac. Require the target prefix instead.
+    liblzfse = cc.find_library('lzfse', has_headers: ['lzfse.h'], required: true)
+  else
+    if build_machine.cpu_family() == 'aarch64'
+      brew_prefix = '/opt/homebrew'
+    else
+      brew_prefix = '/usr/local'
+    endif
+    brew_inc_dirs = include_directories(brew_prefix / 'include', is_system: true)
     raw_liblzfse = cc.find_library('lzfse',
-      dirs: ['/opt/homebrew/lib/', '/usr/local/lib/'],
+      dirs: [brew_prefix / 'lib'],
       header_include_directories: brew_inc_dirs,
       has_headers: ['lzfse.h'],
       required: true
     )
+    liblzfse = declare_dependency(
+      dependencies: raw_liblzfse,
+      include_directories: brew_inc_dirs
+    )
   endif
-  liblzfse = declare_dependency(
-    dependencies: raw_liblzfse,
-    include_directories: brew_inc_dirs
-  )
 else
   liblzfse = cc.find_library('lzfse', has_headers: ['lzfse.h'], required: true)
 endif
