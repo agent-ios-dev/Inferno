@@ -2117,6 +2117,23 @@ static void dwc3_usb_device_handle_packet(USBDevice* dev, USBPacket* p)
     dwc3_process_packet(s, ep, p);
 
 status_update:
+    /* Record the controller state once per prolonged bulk OUT refusal. No
+     * guest addresses, descriptors or payload bytes leave the emulator. Do
+     * not change endpoint events, ownership, retries or completion status. */
+    if (epid >= 2 && p->pid == USB_TOKEN_OUT) {
+        DWC3Endpoint* out_ep = &s->eps[epid];
+        if (p->status == USB_RET_NAK) {
+            if (out_ep->consecutive_out_naks < 1024 && ++out_ep->consecutive_out_naks == 1024) {
+                DWC3Transfer* active = out_ep->xfer;
+                unsigned pending = out_ep->intrnum < DWC3_NUM_INTRS ? s->intrs[out_ep->intrnum].count : 0;
+                error_report("DWC3-OUT-NAK: ep=%u enabled=%u transfer=%u buffers=%u free=%u control=%u events=%u pending=%u",
+                             out_ep->epid, !!(s->dalepena & (1u << epid)), !!active,
+                             active ? active->count : 0, active ? active->can_free : 0,
+                             s->eps[epid & ~1].last_control_command, out_ep->event_en, pending);
+            }
+        }
+        else { out_ep->consecutive_out_naks = 0; }
+    }
     if (usb_packet_is_inflight(p)) {
         if (p->status == USB_RET_NAK) {
             // This rewrite must happen instead of calling

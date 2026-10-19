@@ -102,6 +102,8 @@ typedef struct DWC3Endpoint
     uint32_t last_control_command;
     bool     send_not_ready_control_data;
     uint32_t rsc_idx_counter;
+    /* Diagnostic only: saturates, and resets after a non-NAK OUT. */
+    uint32_t consecutive_out_naks;
 } DWC3Endpoint;
 
 typedef struct DWC3DeviceState
