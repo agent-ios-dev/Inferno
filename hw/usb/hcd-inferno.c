@@ -55,6 +55,7 @@ static void usb_inferno_host_reset_bus(USBInfernoHostState* s);
 
 static void usb_inferno_host_closed(USBInfernoHostState* s)
 {
+    BQL_LOCK_GUARD();
     QIOChannel* ioc = s->ioc;
 
     DPRINTF("%s\n", __func__);
@@ -163,19 +164,22 @@ static void coroutine_fn usb_inferno_host_respond_packet_co(void* opaque)
     WITH_QEMU_LOCK_GUARD(&s->write_mutex)
     {
         if (!s->closed && ioc != NULL) {
-            hdr.type    = INFERNO_RESPONSE;
-            resp.addr   = pkt->addr;
-            resp.pid    = p->pid;
-            resp.ep     = p->ep->nr;
-            resp.id     = p->id;
-            resp.status = p->status;
-            resp.length = p->iov.size;
+            {
+                BQL_LOCK_GUARD();
+                hdr.type    = INFERNO_RESPONSE;
+                resp.addr   = pkt->addr;
+                resp.pid    = p->pid;
+                resp.ep     = p->ep->nr;
+                resp.id     = p->id;
+                resp.status = p->status;
+                resp.length = p->iov.size;
 
-            if (resp.length > p->actual_length) { resp.length = p->actual_length; }
+                if (resp.length > p->actual_length) { resp.length = p->actual_length; }
 
-            if (p->pid == USB_TOKEN_IN && p->status != USB_RET_ASYNC) {
-                buffer = g_malloc(resp.length);
-                iov_to_buf(p->iov.iov, p->iov.niov, 0, buffer, resp.length);
+                if (p->pid == USB_TOKEN_IN && p->status != USB_RET_ASYNC) {
+                    buffer = g_malloc(resp.length);
+                    iov_to_buf(p->iov.iov, p->iov.niov, 0, buffer, resp.length);
+                }
             }
 
             if (!inferno_write(ioc, &hdr, sizeof(hdr))) {
@@ -197,6 +201,7 @@ static void coroutine_fn usb_inferno_host_respond_packet_co(void* opaque)
         }
     }
 
+    BQL_LOCK_GUARD();
     if (!usb_packet_is_inflight(p)) {
         if (pkt->buffer) { g_free(pkt->buffer); }
         usb_packet_cleanup(p);
@@ -244,47 +249,41 @@ static void coroutine_fn usb_inferno_host_msg_loop_co(void* opaque)
                 DPRINTF("%s: INFERNO_REQUEST addr: %d pid: 0x%x ep: %d id: 0x%" PRIx64 "\n", __func__, pkt_hdr.addr,
                         pkt_hdr.pid, pkt_hdr.ep, pkt_hdr.id);
 
-                dev = usb_inferno_host_find_device(s, pkt_hdr.addr);
-                ep  = (dev == NULL) ? NULL : usb_ep_get(dev, pkt_hdr.pid, pkt_hdr.ep);
-                if (ep == NULL) {
-                    if (pkt_hdr.length > 0 && pkt_hdr.pid != USB_TOKEN_IN) {
-                        g_autofree void* discard = g_malloc0(pkt_hdr.length);
-                        if (unlikely(inferno_read(ioc, discard, pkt_hdr.length) != pkt_hdr.length)) {
-                            usb_inferno_host_closed(s);
-                            return;
-                        }
+                /* Socket reads may yield and resume without the BQL. Consume
+                 * the complete frame before touching device/endpoint state. */
+                if (pkt_hdr.length > 0) {
+                    buffer = g_malloc0(pkt_hdr.length);
+                    if (pkt_hdr.pid != USB_TOKEN_IN &&
+                        unlikely(inferno_read(ioc, buffer, pkt_hdr.length) != pkt_hdr.length)) {
+                        usb_inferno_host_closed(s);
+                        return;
                     }
+                }
+                {
+                    BQL_LOCK_GUARD();
+                    dev = usb_inferno_host_find_device(s, pkt_hdr.addr);
+                    ep  = (dev == NULL) ? NULL : usb_ep_get(dev, pkt_hdr.pid, pkt_hdr.ep);
+                    if (ep != NULL) {
+                        usb_packet_init(&pkt->p);
+                        usb_packet_setup(&pkt->p, pkt_hdr.pid, ep, pkt_hdr.stream, pkt_hdr.id, pkt_hdr.short_not_ok,
+                                         pkt_hdr.int_req);
+                        if (pkt_hdr.length > 0) {
+                            usb_packet_addbuf(&pkt->p, buffer, pkt_hdr.length);
+                            pkt->buffer = g_steal_pointer(&buffer);
+                        }
+                        pkt->dev  = ep->dev;
+                        pkt->s    = s;
+                        pkt->addr = pkt_hdr.addr;
+                        assert_true(bql_locked());
+                        usb_handle_packet(pkt->dev, &pkt->p);
+                    }
+                }
+                if (ep == NULL) {
                     DPRINTF("%s: INFERNO_REQUEST no device at addr %d ep %d\n", __func__, pkt_hdr.addr, pkt_hdr.ep);
                     usb_inferno_host_respond_error(s, &pkt_hdr, USB_RET_NODEV);
                     break;
                 }
 
-                usb_packet_init(&pkt->p);
-                usb_packet_setup(&pkt->p, pkt_hdr.pid, ep, pkt_hdr.stream, pkt_hdr.id, pkt_hdr.short_not_ok,
-                                 pkt_hdr.int_req);
-
-                if (pkt_hdr.length > 0) {
-                    buffer = g_malloc0(pkt_hdr.length);
-
-                    if (pkt_hdr.pid != USB_TOKEN_IN) {
-                        if (unlikely(inferno_read(ioc, buffer, pkt_hdr.length) != pkt_hdr.length)) {
-                            usb_inferno_host_closed(s);
-                            usb_packet_cleanup(&pkt->p);
-                            return;
-                        }
-                    }
-
-                    usb_packet_addbuf(&pkt->p, buffer, pkt_hdr.length);
-                    pkt->buffer = buffer;
-                    g_steal_pointer(&buffer);
-                }
-
-                pkt->dev  = ep->dev;
-                pkt->s    = s;
-                pkt->addr = pkt_hdr.addr;
-                assert_true(bql_locked());
-
-                usb_handle_packet(pkt->dev, &pkt->p);
                 usb_inferno_host_respond_packet(s, pkt);
                 g_steal_pointer(&pkt);
                 break;
@@ -305,17 +304,17 @@ static void coroutine_fn usb_inferno_host_msg_loop_co(void* opaque)
 
                 DPRINTF("%s: INFERNO_CANCEL pid: 0x%x ep: %d\n", __func__, pkt_hdr.pid, pkt_hdr.ep);
 
-                assert_true(bql_locked());
-                USBDevice* dev = usb_inferno_host_find_device(s, pkt_hdr.addr);
-                p = (dev == NULL) ? NULL : usb_ep_find_packet_by_id(dev, pkt_hdr.pid, pkt_hdr.ep, pkt_hdr.id);
-                if (p) {
-                    pkt = container_of(p, USBInfernoPacket, p);
-                    usb_cancel_packet(&pkt->p);
-                    DPRINTF("%s: INFERNO_CANCEL: packet"
-                            " pid: 0x%x ep: %d id: 0x%" PRIx64 " len: 0x%x\n",
-                            __func__, pkt_hdr.pid, pkt_hdr.ep, pkt_hdr.id, p->actual_length);
-                    usb_inferno_host_respond_packet(s, pkt);
+                {
+                    BQL_LOCK_GUARD();
+                    assert_true(bql_locked());
+                    USBDevice* dev = usb_inferno_host_find_device(s, pkt_hdr.addr);
+                    p = (dev == NULL) ? NULL : usb_ep_find_packet_by_id(dev, pkt_hdr.pid, pkt_hdr.ep, pkt_hdr.id);
+                    if (p) {
+                        pkt = container_of(p, USBInfernoPacket, p);
+                        usb_cancel_packet(&pkt->p);
+                    }
                 }
+                if (pkt) { usb_inferno_host_respond_packet(s, pkt); }
                 else {
                     warn_report("%s: INFERNO_CANCEL: packet"
                                 " pid: 0x%x ep: %d id: 0x%" PRIx64 " not found",
@@ -323,11 +322,13 @@ static void coroutine_fn usb_inferno_host_msg_loop_co(void* opaque)
                 }
                 break;
             }
-            case INFERNO_RESET:
+            case INFERNO_RESET: {
                 DPRINTF("%s: INFERNO_RESET\n", __func__);
+                BQL_LOCK_GUARD();
                 assert_true(bql_locked());
                 usb_inferno_host_reset_bus(s);
                 break;
+            }
             default: assert_not_reached(); break;
         }
     }
