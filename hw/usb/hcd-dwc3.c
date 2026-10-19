@@ -792,7 +792,9 @@ static void dwc3_td_fetch(DWC3State* s, DWC3Transfer* xfer, dma_addr_t tdaddr)
 
         count = dwc3_bd_length(s, tdaddr);
         if (count < 0) {
-            ended = true;
+            /* Negative means a terminal descriptor (LST or an unowned next
+             * TRB), not that only its first TRB should be fetched. Let the
+             * actual LST/HWO checks terminate after all owned TRBs. */
             count = -count;
         }
         if (count == 0) {
