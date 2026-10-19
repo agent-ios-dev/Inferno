@@ -79,6 +79,7 @@ typedef struct DWC3Transfer
     uint32_t count;
     uint32_t rsc_idx;
     bool     can_free;
+    uint32_t fetch_stop_reason; /* Bounded diagnostic, no guest addresses. */
 } DWC3Transfer;
 
 typedef struct DWC3Endpoint

@@ -770,11 +770,22 @@ static void dwc3_td_free(DWC3State* s, DWC3Transfer* xfer)
     g_free(xfer);
 }
 
+static bool dwc3_bd_contains_trb(const DWC3BufferDesc* desc, dma_addr_t address)
+{
+    /* A link targets a TRB, not every higher guest address. The descriptor's
+     * count excludes its link TRB, and only populated entries belong to it. */
+    for (uint32_t i = 0; i < desc->count; i++) {
+        if (desc->trbs[i].addr == address) { return true; }
+    }
+    return false;
+}
+
 static void dwc3_td_fetch(DWC3State* s, DWC3Transfer* xfer, dma_addr_t tdaddr)
 {
     struct dwc3_trb trb = {0};
     int             count;
     bool            ended = false;
+    xfer->fetch_stop_reason = 0;
 
     do {
         DWC3BufferDesc* desc;
@@ -785,6 +796,7 @@ static void dwc3_td_fetch(DWC3State* s, DWC3Transfer* xfer, dma_addr_t tdaddr)
             count = -count;
         }
         if (count == 0) {
+            xfer->fetch_stop_reason = 1; /* No owned data TRBs at the cursor. */
             ended = true;
             break;
         }
@@ -804,6 +816,7 @@ static void dwc3_td_fetch(DWC3State* s, DWC3Transfer* xfer, dma_addr_t tdaddr)
             if (dma_memory_read(desc->sgl.as, tdaddr, &trb, sizeof(trb), MEMTXATTRS_UNSPECIFIED) != MEMTX_OK) {
                 qemu_log_mask(LOG_GUEST_ERROR, "%s: failed to read trb\n", __func__);
                 ended = true;
+                xfer->fetch_stop_reason = 9; /* Descriptor read failed. */
                 break;
             }
             uint32_t controlType = TRB_CTRL_TRBCTL(trb.ctrl);
@@ -815,6 +828,7 @@ static void dwc3_td_fetch(DWC3State* s, DWC3Transfer* xfer, dma_addr_t tdaddr)
                 qemu_log_mask(LOG_GUEST_ERROR, "%s: unsupported TRBCTL %d at 0x%" HWADDR_PRIx "\n", __func__,
                               controlType, tdaddr);
                 ended = true;
+                xfer->fetch_stop_reason = 2; /* Unsupported TRB type. */
                 break;
             }
             DPRINTF("%s: tdaddr 0x%" HWADDR_PRIx " controlType: %d trb.ctrl: 0x%x\n", __func__, tdaddr, controlType,
@@ -822,6 +836,7 @@ static void dwc3_td_fetch(DWC3State* s, DWC3Transfer* xfer, dma_addr_t tdaddr)
 
             if (!(trb.ctrl & TRB_CTRL_HWO)) {
                 ended = true;
+                xfer->fetch_stop_reason = 3;
                 DPRINTF("%s: ended;break: (!(trb.ctrl & TRB_CTRL_HWO))\n", __func__);
                 break;
             }
@@ -832,9 +847,10 @@ static void dwc3_td_fetch(DWC3State* s, DWC3Transfer* xfer, dma_addr_t tdaddr)
                 tdaddr = dwc3_addr64(trb.bpl, trb.bph);
                 DPRINTF("%s: TRBCTL_LINK_TRB: link_tdaddr 0x%" HWADDR_PRIx "\n", __func__, tdaddr);
 
-                if (desc->trbs[0].addr <= tdaddr && tdaddr <= desc->trbs[0].addr + sizeof(trb) * (count + 1)) {
+                if (dwc3_bd_contains_trb(desc, tdaddr)) {
                     /* self loop */
                     ended = true;
+                    xfer->fetch_stop_reason = 4; /* Actual self loop. */
                     DPRINTF("%s: ended;break: self-loop\n", __func__);
                     break;
                 }
@@ -842,8 +858,9 @@ static void dwc3_td_fetch(DWC3State* s, DWC3Transfer* xfer, dma_addr_t tdaddr)
                 /* Multi Buffer Loops */
                 QTAILQ_FOREACH (d, &xfer->buffers, queue) {
                     assert(d->count > 0 && d->trbs);
-                    if (d->trbs[0].addr <= tdaddr && d->trbs[d->count - 1].addr <= tdaddr) {
+                    if (dwc3_bd_contains_trb(d, tdaddr)) {
                         ended = true;
+                        xfer->fetch_stop_reason = 5; /* Actual queued-buffer loop. */
                         DPRINTF("%s: ended;break: multi-buffer-loops\n", __func__);
                         break;
                     }
@@ -853,6 +870,7 @@ static void dwc3_td_fetch(DWC3State* s, DWC3Transfer* xfer, dma_addr_t tdaddr)
             if (desc->count >= count) {
                 /* We don't include the link TRB in the desc count */
                 ended = true;
+                xfer->fetch_stop_reason = 6; /* Allocated TRB count exhausted. */
                 DPRINTF("%s: ended;break: We don't include the link TRB in the "
                         "desc count\n",
                         __func__);
@@ -871,6 +889,7 @@ static void dwc3_td_fetch(DWC3State* s, DWC3Transfer* xfer, dma_addr_t tdaddr)
             if (trb.ctrl & TRB_CTRL_LST) {
                 xfer->can_free = true;
                 ended          = true;
+                xfer->fetch_stop_reason = 7; /* LST terminates the transfer. */
                 DPRINTF("%s: ended;break: (trb.ctrl & TRB_CTRL_LST)\n", __func__);
                 break;
             }
@@ -885,6 +904,7 @@ static void dwc3_td_fetch(DWC3State* s, DWC3Transfer* xfer, dma_addr_t tdaddr)
         xfer->count++;
     }
     while (!ended && xfer->count < 256);
+    if (!ended && xfer->count >= 256) { xfer->fetch_stop_reason = 8; }
     xfer->tdaddr = tdaddr;
 #ifdef DEBUG_DWC3
     #if 1
@@ -2142,6 +2162,8 @@ status_update:
                              out_ep->out_nak_reason, !!first, first ? first->count : 0,
                              first ? first->actual_length : 0, first ? first->length : 0,
                              out_ep->consecutive_out_naks);
+                error_report("DWC3-OUT-FETCH: ep=%u stop=%u", out_ep->epid,
+                             active ? active->fetch_stop_reason : 0);
             }
         }
         else { out_ep->consecutive_out_naks = 0; }
