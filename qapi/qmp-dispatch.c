@@ -113,6 +113,9 @@ typedef struct QmpDispatchBH
 
 static void do_qmp_dispatch_bh(void* opaque)
 {
+    /* This callback also runs when iohandler_ctx is polled without the BQL.
+     * Non-coroutine monitor commands may access block global/device state. */
+    BQL_LOCK_GUARD();
     QmpDispatchBH* data = opaque;
 
     assert(monitor_cur() == NULL);
