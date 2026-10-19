@@ -105,6 +105,8 @@ struct AppleSEPSSCState
     uint8_t               kbkdf_keys[KBKDF_KEY_MAX_SLOTS][KBKDF_CMAC_OUTPUT_LEN];
     uint32_t              kbkdf_counter[KBKDF_KEY_MAX_SLOTS];
     uint8_t               cpsn[0x07];
+    bool                  status_diagnostics;
+    uint8_t               status_counts[10];
 };
 
 static bool ssc_store_range_valid(uint64_t offset, uint64_t len)
@@ -1006,6 +1008,13 @@ static uint8_t apple_sep_ssc_rx(I2CSlave* i2c)
         else if (cmd == 0x09) {    // req 0x04 bytes, resp 0x2F bytes
             answer_cmd_0x9_panic(ssc, ssc->req_cmd, ssc->resp_cmd);
         }
+        /* Optional bounded status only. Never log keys, nonces or payloads. */
+        if (ssc->status_diagnostics && cmd < ARRAY_SIZE(ssc->status_counts)
+            && ssc->status_counts[cmd] < 16) {
+            ssc->status_counts[cmd]++;
+            info_report("SSC-STATUS command=%u result=%u observation=%u", cmd,
+                        ssc->resp_cmd[3], ssc->status_counts[cmd]);
+        }
         ssc->req_cur = 0;
         memset(ssc->req_cmd, 0, sizeof(ssc->req_cmd));
         HEXDUMP("apple_sep_ssc_rx: before resp_cmd invalid check", ssc->resp_cmd, sizeof(ssc->resp_cmd));
@@ -1065,6 +1074,7 @@ static void apple_sep_ssc_reset_enter(Object* obj, ResetType type)
     memset(ssc->slot_hmac_key, 0, sizeof(ssc->slot_hmac_key));
     memset(ssc->kbkdf_keys, 0, sizeof(ssc->kbkdf_keys));
     memset(ssc->kbkdf_counter, 0, sizeof(ssc->kbkdf_counter));
+    memset(ssc->status_counts, 0, sizeof(ssc->status_counts));
     uint8_t cpsn[0x07] = {0xDE, 0xAD, 0xBE, 0xEF, 0xCA, 0xFE, 0xFE};
     memcpy(ssc->cpsn, cpsn, sizeof(cpsn));
 }
@@ -1136,6 +1146,7 @@ AppleSEPSSCState* apple_sep_ssc_create(AppleI2CState* i2c, uint8_t addr, AppleSE
 
 static const Property apple_sep_ssc_props[] = {
     DEFINE_PROP_DRIVE("drive", AppleSEPSSCState, blk),
+    DEFINE_PROP_BOOL("status-diagnostics", AppleSEPSSCState, status_diagnostics, false),
 };
 
 static void apple_sep_ssc_class_init(ObjectClass* klass, const void* data)
